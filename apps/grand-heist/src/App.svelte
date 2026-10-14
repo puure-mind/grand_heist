@@ -3,14 +3,24 @@
   import {
     REEL_COUNT,
     ROW_COUNT,
+    SYMBOL_IDS,
     SYMBOL_DEFINITIONS,
     type CellCoord,
+    type LineWinRoundEvent,
     type MockVisualState,
+    type ReelGrid,
+    type RevealRoundEvent,
     type SymbolId,
+    type TotalWinRoundEvent,
+    type RoundEvent,
     type VerticalWildEvent
   } from '@grand-heist/contract';
+  import { tick } from 'svelte';
+  import { AnimationController, type WinTier } from './lib/animation-controller.js';
   import { createLocalGameClient } from './lib/client/local-game-client.js';
+  import { collectRoundEventTypes } from './lib/round-player.js';
   import {
+    MOCK_ROUNDS,
     MOCK_STATE_IDS,
     MOCK_VISUAL_STATES,
     isMockStateId,
@@ -125,6 +135,17 @@
   const initialMockStateId = resolveInitialMockState();
   const showDevTools = searchParams.get('dev') === '1';
   const client = createLocalGameClient(initialMockStateId);
+  const animationController = new AnimationController();
+  const REEL_BUFFER_TOP = 2;
+  const REEL_BUFFER_BOTTOM = 1;
+  const REEL_STRIP_LENGTH = REEL_BUFFER_TOP + ROW_COUNT + REEL_BUFFER_BOTTOM;
+
+  type DevRoundPlayerWindow = Window & {
+    grandHeistRoundPlayer?: {
+      rounds: typeof MOCK_ROUNDS;
+      play(roundId: MockStateId): Promise<string[]>;
+    };
+  };
 
   const symbolAssets: Record<string, string> = {
     car: carImage,
@@ -407,7 +428,12 @@
 
   let selectedMockStateId: MockStateId = initialMockStateId;
   let state: MockVisualState = client.getState();
+  let animatedReels: SymbolId[][] = buildAnimatedReels(state.reels);
+  let useReferenceReadySymbols = selectedMockStateId === 'ready';
   let isPlaying = false;
+  let autoSpinTimer: ReturnType<typeof setTimeout> | undefined;
+  let displayedWinAmountMinor = 0;
+  let activeLineWinAmountMinor = 0;
   let musicEnabled = true;
   let soundEnabled = true;
   let autoSpinEnabled = false;
@@ -425,6 +451,13 @@
   let showMostWantedBonus = false;
   let showGambleBonus = false;
   let showBigScoreBonus = false;
+  let reelElements: HTMLElement[] = [];
+  let symbolElements: HTMLElement[][] = [];
+  let totalWinElement: HTMLElement | undefined;
+  let winScreenElement: HTMLElement | undefined;
+  let winScreenAmountElement: HTMLElement | undefined;
+  let winScreenLockedForAnimation = false;
+  let animatedWinScreen: WinScreen | null = null;
   let mostWantedFsLeft = 10;
   const bigScoreScreenFsLeft = 10;
 
@@ -446,7 +479,20 @@
   $: onboardingPage = onboardingPages[onboardingPageIndex];
   $: infoPage = infoPages[infoPageIndex];
   $: bonusBuyBet = bonusBuyBetValues[bonusBuyBetIndex];
-  $: activeWinScreen = winScreens[winScreenIndex];
+  $: activeWinScreen = animatedWinScreen ?? winScreens[winScreenIndex];
+  $: {
+    if (autoSpinEnabled && !isPlaying && !autoSpinTimer) {
+      autoSpinTimer = setTimeout(() => {
+        autoSpinTimer = undefined;
+        if (autoSpinEnabled && !isPlaying) void playSelectedState();
+      }, 700);
+    }
+
+    if ((!autoSpinEnabled || isPlaying) && autoSpinTimer) {
+      clearTimeout(autoSpinTimer);
+      autoSpinTimer = undefined;
+    }
+  }
 
 
   onMount(() => {
@@ -459,7 +505,23 @@
     updateLayout();
     media.addEventListener('change', updateLayout);
 
+    if (showDevTools) {
+      const devWindow = window as DevRoundPlayerWindow;
+      devWindow.grandHeistRoundPlayer = {
+        rounds: MOCK_ROUNDS,
+        play(roundId: MockStateId) {
+          return collectRoundEventTypes(MOCK_ROUNDS[roundId]);
+        },
+      };
+    }
+
     return () => {
+      if (autoSpinTimer) clearTimeout(autoSpinTimer);
+      animationController.destroy();
+      const devWindow = window as DevRoundPlayerWindow;
+      if (devWindow.grandHeistRoundPlayer?.rounds === MOCK_ROUNDS) {
+        delete devWindow.grandHeistRoundPlayer;
+      }
       media.removeEventListener('change', updateLayout);
     };
   });
@@ -469,7 +531,7 @@
     currency: state.currency,
     minimumFractionDigits: 2
   });
-  $: winAmount = state.totalBet * state.winMultiplier;
+  $: winAmount = displayedWinAmountMinor / 100;
   $: winFormatter = new Intl.NumberFormat('en-US', {
     style: 'currency',
     currency: state.currency,
@@ -518,6 +580,44 @@
     return SYMBOL_DEFINITIONS[symbolId];
   }
 
+  function symbolAt(seed: number): SymbolId {
+    return SYMBOL_IDS[((seed % SYMBOL_IDS.length) + SYMBOL_IDS.length) % SYMBOL_IDS.length];
+  }
+
+  function buildAnimatedReel(reel: readonly SymbolId[], reelIndex: number): SymbolId[] {
+    const top = Array.from({ length: REEL_BUFFER_TOP }, (_, index) => symbolAt(reelIndex * 7 + index));
+    const bottom = Array.from({ length: REEL_BUFFER_BOTTOM }, (_, index) => symbolAt(reelIndex * 7 + reel.length + index));
+
+    return [...top, ...reel, ...bottom].slice(0, REEL_STRIP_LENGTH);
+  }
+
+  function buildAnimatedReels(reels: ReelGrid): SymbolId[][] {
+    return reels.map((reel, reelIndex) => buildAnimatedReel(reel, reelIndex));
+  }
+
+  function visibleRowForStripIndex(stripIndex: number): number | null {
+    const row = stripIndex - REEL_BUFFER_TOP;
+    return row >= 0 && row < ROW_COUNT ? row : null;
+  }
+
+  function rotateReelSymbols(reelIndex: number) {
+    const reel = animatedReels[reelIndex];
+    if (!reel) return;
+
+    const [first, ...rest] = reel;
+    animatedReels = animatedReels.map((current, index) => (index === reelIndex ? [...rest, first] : current));
+  }
+
+  function prepareRevealReel(reelIndex: number, reel: readonly SymbolId[]) {
+    animatedReels = animatedReels.map((current, index) => {
+      if (index !== reelIndex) return current;
+
+      const top = Array.from({ length: REEL_BUFFER_TOP }, (_, topIndex) => symbolAt(reelIndex * 11 + topIndex));
+      const bottom = current.slice(-REEL_BUFFER_BOTTOM);
+      return [...top, ...reel, ...bottom].slice(0, REEL_STRIP_LENGTH);
+    });
+  }
+
   function normalizeAssetKey(value: unknown): string {
     return String(value ?? '')
       .toLowerCase()
@@ -546,7 +646,7 @@
     reel: number,
     row: number
   ): string | undefined {
-    if (selectedMockStateId === 'ready') {
+    if (useReferenceReadySymbols) {
       const referenceSymbols = isMobileLayout ? referenceMobileSymbols : referenceReadySymbols;
       return referenceSymbols[reel]?.[row];
     }
@@ -560,17 +660,179 @@
   }
 
   function selectMockState(event: Event) {
+    if (isPlaying) return;
+
     const target = event.currentTarget as HTMLSelectElement;
     selectedMockStateId = isMockStateId(target.value) ? target.value : 'ready';
     state = client.selectState(selectedMockStateId);
+    useReferenceReadySymbols = selectedMockStateId === 'ready';
+    animatedReels = buildAnimatedReels(state.reels);
+    displayedWinAmountMinor = Math.round(state.totalBet * state.winMultiplier * 100);
+    activeLineWinAmountMinor = 0;
+  }
+
+  function setReelElement(node: HTMLElement, index: number) {
+    reelElements[index] = node;
+    animationController.setTargets({ reels: reelElements });
+  }
+
+  function setSymbolElement(node: HTMLElement, coord: [number, number]) {
+    const [reel, row] = coord;
+    symbolElements[reel] ??= [];
+    symbolElements[reel][row] = node;
+    animationController.setTargets({ symbols: symbolElements });
+  }
+
+  function setVisibleSymbolElement(node: HTMLElement, coord: [number, number] | null) {
+    if (!coord) return;
+    setSymbolElement(node, coord);
+  }
+
+  function setTotalWinElement(node: HTMLElement) {
+    totalWinElement = node;
+    animationController.setTargets({ totalWin: totalWinElement });
+  }
+
+  function setWinScreenElement(node: HTMLElement) {
+    winScreenElement = node;
+    animationController.setTargets({ winScreen: winScreenElement });
+  }
+
+  function setWinScreenAmountElement(node: HTMLElement) {
+    winScreenAmountElement = node;
+    animationController.setTargets({ winScreenAmount: winScreenAmountElement });
+  }
+
+  function patchState(patch: Partial<MockVisualState>) {
+    state = { ...state, ...patch };
+  }
+
+  function isRevealRoundEvent(event: RoundEvent): event is RevealRoundEvent {
+    return event.type === 'reveal' && 'reels' in event;
+  }
+
+  function isLineWinRoundEvent(event: RoundEvent): event is LineWinRoundEvent {
+    return event.type === 'lineWin' && 'cells' in event;
+  }
+
+  function isTotalWinRoundEvent(event: RoundEvent): event is TotalWinRoundEvent {
+    return event.type === 'totalWin' && typeof event.amount === 'number';
+  }
+
+  function revealEventFor(events: readonly RoundEvent[], fallback: ReelGrid): RevealRoundEvent {
+    return events.find(isRevealRoundEvent) ?? { type: 'reveal', reels: fallback };
+  }
+
+  function totalWinFor(events: readonly RoundEvent[]): number {
+    return [...events].reverse().find(isTotalWinRoundEvent)?.amount ?? 0;
+  }
+
+  function lineWinsFor(events: readonly RoundEvent[]): LineWinRoundEvent[] {
+    return events.filter(isLineWinRoundEvent);
+  }
+
+  function formatMinorWin(amount: number): string {
+    return winFormatter.format(amount / 100);
+  }
+
+  function winTierScreen(tier: WinTier, amount: number): WinScreen {
+    const titleImage = tier === 'big' ? bigWinTitleImage : tier === 'mega' ? megaWinTitleImage : epicWinTitleImage;
+    const label = tier === 'big' ? 'Big win' : tier === 'mega' ? 'Mega win' : 'Epic win';
+    return { kind: tier, titleImage, label, amount: formatMinorWin(amount) };
+  }
+
+  function requestSkipCurrentRoundEvent() {
+    if (!isPlaying) return;
+    animationController.skip();
+  }
+
+  function handleGlobalPointerDown(event: PointerEvent) {
+    if (event.button !== 0) return;
+    requestSkipCurrentRoundEvent();
+  }
+
+  function handleGlobalKeydown(event: KeyboardEvent) {
+    if (event.code !== 'Space' || !isPlaying) return;
+
+    event.preventDefault();
+    requestSkipCurrentRoundEvent();
   }
 
   async function playSelectedState() {
     if (isPlaying) return;
 
     isPlaying = true;
+    displayedWinAmountMinor = 0;
+    activeLineWinAmountMinor = 0;
+    patchState({ highlightedCells: [], message: 'Spinning', detail: 'Waiting for reels.' });
+    animationController.startSpin({ onStep: rotateReelSymbols });
     try {
-      state = await client.play({ mockStateId: selectedMockStateId });
+      const round = await client.play({ betAmount: Math.round(state.totalBet * 100) });
+      const reveal = revealEventFor(round.events, round.finalState.reels);
+      await animationController.stopSpin({
+        reels: reveal.reels,
+        prepareReveal: prepareRevealReel,
+        commitReveal: () => {
+          patchState({
+            reels: reveal.reels,
+            highlightedCells: [],
+            scatterCells: [],
+            verticalWilds: [],
+            status: 'ready',
+            message: 'Revealed',
+            detail: 'Reels stopped.',
+          });
+          useReferenceReadySymbols = false;
+          animatedReels = buildAnimatedReels(reveal.reels);
+        },
+      });
+
+      const lineWins = lineWinsFor(round.events);
+      const totalWin = totalWinFor(round.events);
+      const lineAnimation = animationController.playLineWins(lineWins, (lineWin) => {
+        if (!lineWin) {
+          patchState({ highlightedCells: round.finalState.highlightedCells });
+          activeLineWinAmountMinor = 0;
+          return;
+        }
+
+        patchState({
+          highlightedCells: lineWin.cells,
+          status: 'lineWin',
+          message: 'Line Win',
+          detail: `Line ${lineWin.line} pays.`,
+        });
+        activeLineWinAmountMinor = lineWin.amount;
+      });
+      const counterAnimation = animationController.countPanelWin(0, totalWin, (amount) => {
+        displayedWinAmountMinor = amount;
+      });
+      await Promise.all([lineAnimation, counterAnimation]);
+
+      state = round.finalState;
+      displayedWinAmountMinor = totalWin;
+      activeLineWinAmountMinor = 0;
+
+      if (totalWin / 100 / state.totalBet >= 20) {
+        animatedWinScreen = winTierScreen('big', 0);
+        showWinScreen = true;
+        winScreenLockedForAnimation = true;
+        await tick();
+        await animationController.playBigWin({
+          amount: totalWin,
+          totalBet: state.totalBet,
+          formatAmount: formatMinorWin,
+          onAmount(amount) {
+            if (animatedWinScreen) animatedWinScreen = { ...animatedWinScreen, amount };
+          },
+          onTier(tier) {
+            animatedWinScreen = winTierScreen(tier, displayedWinAmountMinor);
+          },
+        });
+        showWinScreen = false;
+        winScreenLockedForAnimation = false;
+        animatedWinScreen = null;
+      }
     } finally {
       isPlaying = false;
     }
@@ -711,6 +973,11 @@
   }
 
   function advanceWinScreen() {
+    if (winScreenLockedForAnimation) {
+      animationController.skip();
+      return;
+    }
+
     if (winScreenIndex < winScreens.length - 1) {
       winScreenIndex += 1;
       return;
@@ -841,6 +1108,8 @@
     showOnboarding ? ' onboarding-active' : ''
   }${showMostWantedBonus ? ' most-wanted-bonus-active' : ''}${showGambleBonus ? ' gamble-bonus-active' : ''}`}
   data-status={state.status}
+  onpointerdown={handleGlobalPointerDown}
+  onkeydown={handleGlobalKeydown}
 >
   <img
     class="adaptive-background desktop-adaptive-background"
@@ -1367,43 +1636,49 @@
         role="grid"
         aria-label={`${REEL_COUNT} reels by ${ROW_COUNT} rows visual state`}
       >
-        {#each state.reels as reel, reelIndex}
+        {#each animatedReels as reel, reelIndex}
           {@const verticalWild = verticalWildFor(reelIndex)}
-          <div class="reel" role="presentation">
-            {#each reel as symbolId, rowIndex}
-              {@const symbol = symbolFor(symbolId)}
-              {@const wildCell = isVerticalWildCell(verticalWild, rowIndex)}
-              {@const symbolImage = visualSymbolImageFor(
-                symbolId,
-                symbol.label,
-                symbol.shortLabel,
-                reelIndex,
-                rowIndex
-              )}
-              <div
-                class:highlighted={isHighlighted(reelIndex, rowIndex)}
-                class:scatter-cue={isScatterCue(reelIndex, rowIndex)}
-                class:vertical-wild-cell={wildCell}
-                class={`symbol symbol-${symbol.category}`}
-                role="gridcell"
-                aria-label={wildCell ? (verticalWild?.label ?? symbol.label) : symbol.label}
-              >
-                <div class="symbol-glow" aria-hidden="true"></div>
+          <div class="reel-window" role="presentation">
+            <div class="reel-strip" use:setReelElement={reelIndex}>
+              {#each reel as symbolId, stripIndex}
+                {@const symbol = symbolFor(symbolId)}
+                {@const rowIndex = visibleRowForStripIndex(stripIndex)}
+                {@const isVisibleCell = rowIndex !== null}
+                {@const wildCell = isVisibleCell && isVerticalWildCell(verticalWild, rowIndex)}
+                {@const symbolImage = visualSymbolImageFor(
+                  symbolId,
+                  symbol.label,
+                  symbol.shortLabel,
+                  reelIndex,
+                  rowIndex ?? 0
+                )}
+                <div
+                  class:hidden-buffer={!isVisibleCell}
+                  class:highlighted={isVisibleCell && isHighlighted(reelIndex, rowIndex)}
+                  class:scatter-cue={isVisibleCell && isScatterCue(reelIndex, rowIndex)}
+                  class:vertical-wild-cell={wildCell}
+                  class={`symbol symbol-${symbol.category}`}
+                  use:setVisibleSymbolElement={isVisibleCell ? [reelIndex, rowIndex] : null}
+                  role="gridcell"
+                  aria-label={wildCell ? (verticalWild?.label ?? symbol.label) : symbol.label}
+                >
+                  <div class="symbol-glow" aria-hidden="true"></div>
 
-                {#if wildCell}
-                  <img
-                    class="symbol-image chase-symbol"
-                    src={chaseImageFor(verticalWild)}
-                    alt=""
-                    draggable="false"
-                  />
-                {:else if symbolImage}
-                  <img class="symbol-image" src={symbolImage} alt="" draggable="false" />
-                {:else}
-                  <span class="symbol-fallback">{symbol.shortLabel}</span>
-                {/if}
-              </div>
-            {/each}
+                  {#if wildCell}
+                    <img
+                      class="symbol-image chase-symbol"
+                      src={chaseImageFor(verticalWild)}
+                      alt=""
+                      draggable="false"
+                    />
+                  {:else if symbolImage}
+                    <img class="symbol-image" src={symbolImage} alt="" draggable="false" />
+                  {:else}
+                    <span class="symbol-fallback">{symbol.shortLabel}</span>
+                  {/if}
+                </div>
+              {/each}
+            </div>
           </div>
         {/each}
       </div>
@@ -1535,7 +1810,7 @@
       </div>
     </div>
 
-    <div class="total-win-panel">
+    <div class="total-win-panel" use:setTotalWinElement>
       <img src={totalWinBackgroundImage} alt="" draggable="false" />
       <div class="total-win-copy">
         <span>Total win</span>
@@ -2253,6 +2528,7 @@
       tabindex="0"
       onclick={advanceWinScreen}
       onkeydown={handleWinScreenKeydown}
+      use:setWinScreenElement
     >
       <img
         class="win-screen-dim"
@@ -2310,7 +2586,7 @@
             alt=""
             draggable="false"
           />
-          <div class="win-screen-amount">{activeWinScreen.amount}</div>
+          <div class="win-screen-amount" use:setWinScreenAmountElement>{activeWinScreen.amount}</div>
         </div>
       {/if}
     </section>
@@ -2739,16 +3015,27 @@
     box-shadow: none !important;
   }
 
-  .reel {
+  .reel-window {
     position: relative;
-    display: grid;
-    grid-template-rows: repeat(5, minmax(0, 1fr));
-    gap: 0;
     min-width: 0;
     min-height: 0;
+    overflow: hidden;
     background: transparent !important;
     border: 0 !important;
     box-shadow: none !important;
+  }
+
+  .reel-strip {
+    position: absolute;
+    inset: 0 0 auto;
+    height: calc((100% / 5) * 8);
+    display: grid;
+    grid-template-rows: repeat(8, minmax(0, 1fr));
+    gap: 0;
+    min-width: 0;
+    min-height: 0;
+    transform: translateY(calc((-100% / 8) * 2));
+    will-change: transform, filter;
   }
 
   .slot-columns {
